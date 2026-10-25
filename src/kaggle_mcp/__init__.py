@@ -8,13 +8,16 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from kaggle_mcp.browser import KaggleBrowser
 from kaggle_mcp.session import SERVER_INFO, KaggleSession
+from kaggle_mcp.state import default_state_dir
 from kaggle_mcp.tools import register_tools
 
 INSTRUCTIONS = (
-    "Connects to a Kaggle notebook: its cells are pulled into a local working copy you edit "
-    "with the cell tools, code runs on the notebook's live Kaggle kernel (GPU/TPU), and "
-    "save_notebook pushes the copy back as a new version. Start with open_kaggle_connection."
+    "Connects to a Kaggle notebook. open_kaggle_connection opens the notebook's editor in a "
+    "browser kaggle-mcp controls, and the cell tools work in that editor: cells you add "
+    "and run appear there as they run, on the notebook's live Kaggle session (GPU/TPU). "
+    "Start with open_kaggle_connection."
 )
 
 
@@ -47,6 +50,12 @@ def parse_args(argv):
         default=None,
     )
     parser.add_argument(
+        "--no-browser",
+        help="never open the Kaggle editor in a browser; always use the local working copy",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--ephemeral",
         help="do not persist the connection or working copies",
         action="store_true",
@@ -66,15 +75,21 @@ async def main_async() -> None:
     logdir = args.log or tempfile.mkdtemp(prefix="kaggle-mcp-logs-")
     init_logger(logdir)
     SERVER_INFO["log_dir"] = logdir
+    state_dir = (
+        Path(args.state_dir).expanduser() if args.state_dir else default_state_dir()
+    )
+    # Chrome is only launched when a notebook is opened, not at startup.
+    browser = None if args.no_browser else KaggleBrowser(state_dir / "chrome-profile")
     session = KaggleSession(
-        state_dir=Path(args.state_dir).expanduser() if args.state_dir else None,
-        ephemeral=args.ephemeral,
+        state_dir=state_dir, ephemeral=args.ephemeral, browser=browser
     )
     mcp = build_server(session)
     try:
         await mcp.run_async()
     finally:
         await session.close()
+        if browser is not None:
+            await browser.close()
 
 
 def main() -> None:

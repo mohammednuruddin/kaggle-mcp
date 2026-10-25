@@ -24,6 +24,9 @@ class ConnectionState:
     kaggle_session_id: int | None = None
     # URLs from an API-started session that has not been attached yet.
     candidate_server_urls: list[str] | None = None
+    # "editor" while the notebook is worked on in the Chrome window kaggle-mcp
+    # controls, so a restart reconnects to that tab instead of the local copy.
+    mode: str | None = None
 
 
 def default_state_dir() -> Path:
@@ -54,7 +57,7 @@ def load_state(state_dir: Path) -> ConnectionState:
     urls = state.candidate_server_urls
     if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
         state.candidate_server_urls = None
-    for name in ("notebook_ref", "server_url", "kernel_id"):
+    for name in ("notebook_ref", "server_url", "kernel_id", "mode"):
         if not isinstance(getattr(state, name), str):
             setattr(state, name, None)
     return state

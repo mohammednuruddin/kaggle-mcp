@@ -10,6 +10,12 @@ Opening a notebook does three things:
 
 If no server can be found, the notebook editor is opened in the browser so
 the user can start "Run > Kaggle Jupyter Server" and hand back the URL.
+
+By default, though, opening a notebook opens its editor in a browser kaggle-mcp
+controls (browser.py: the user's Edge/Chrome, or its own window) and the cell
+tools work on that live editor: cells the agent adds and runs appear in the tab,
+and no Jupyter server URL is needed. use_browser=False (or no browser) keeps the
+local-working-copy mode.
 """
 
 from __future__ import annotations
@@ -24,7 +30,14 @@ from collections.abc import Callable
 
 from fastmcp.exceptions import ToolError
 
-from kaggle_mcp.document import NotebookDocument
+from kaggle_mcp.bridge import BridgeError, LiveNotebook
+from kaggle_mcp.browser import (
+    BrowserUnavailable,
+    EditorTab,
+    KaggleBrowser,
+    SignInRequired,
+)
+from kaggle_mcp.document import CellNotFound, NotebookDocument
 from kaggle_mcp.kaggle_api import (
     KaggleApi,
     KaggleApiError,
@@ -62,6 +75,9 @@ AUTO_RECONNECT = os.environ.get("KAGGLE_MCP_AUTO_RECONNECT", "1") not in (
     "no",
 )
 
+# How long to wait for the Kaggle editor to load (it starts a session first).
+EDITOR_WAIT = float(os.environ.get("KAGGLE_MCP_EDITOR_WAIT", "120"))
+
 SERVER_INFO: dict = {"log_dir": None}
 
 _PROBE = r"""
@@ -75,6 +91,12 @@ _i["tpu"] = bool(os.environ.get("TPU_ACCELERATOR_TYPE") or os.environ.get("TPU_N
 _i["kaggle_input"] = sorted(os.listdir("/kaggle/input"))[:50] if os.path.isdir("/kaggle/input") else None
 print(json.dumps(_i))
 """
+
+EDITOR_NOTE = (
+    "The notebook is open in {where}: cells you add, edit and run appear in its editor "
+    "as they happen, and code runs on that editor's Kaggle session (the accelerator is "
+    "picked in the editor's settings panel)."
+)
 
 MANUAL_STEPS = (
     "In the Kaggle notebook tab that just opened: Run > Kaggle Jupyter Server, pick the "
@@ -91,12 +113,14 @@ class KaggleSession:
         api: KaggleApi | None = None,
         kernel_factory: Callable[[ServerEndpoint], RemoteKernel] = RemoteKernel,
         open_browser: Callable[[str], Any] = webbrowser.open_new,
+        browser: KaggleBrowser | None = None,
     ):
         self.state_dir = state_dir or default_state_dir()
         self.ephemeral = ephemeral
         self.api = api or KaggleApi()
         self.kernel_factory = kernel_factory
         self.open_browser = open_browser
+        self.browser = browser
         self.state = ConnectionState() if ephemeral else load_state(self.state_dir)
         self.ref: NotebookRef | None = (
             _maybe_ref(self.state.notebook_ref) if self.state.notebook_ref else None
@@ -121,6 +145,41 @@ class KaggleSession:
         if self.ephemeral:
             return None
         return notebook_path(self.state_dir, ref.ref if ref else None)
+
+    # -- which notebook the cell tools work on ----------------------------------
+
+    @property
+    def editor_mode(self) -> bool:
+        return (
+            self.browser is not None
+            and self.ref is not None
+            and self.state.mode == "editor"
+        )
+
+    def editor(self) -> EditorTab | None:
+        """The connected editor tab for the open notebook, if any (no I/O)."""
+        if not self.editor_mode:
+            return None
+        return self.browser.editor_for(self.ref.ref)
+
+    async def editor_tab(self) -> EditorTab | None:
+        """The editor tab in editor mode, reopened if the tab or browser was closed."""
+        if not self.editor_mode:
+            return None
+        tab = self.browser.editor_for(self.ref.ref)
+        if tab is not None:
+            return tab
+        try:
+            return await self.browser.open_editor(self.ref, EDITOR_WAIT)
+        except ToolError as exc:
+            raise ToolError(
+                f"The Kaggle editor tab for {self.ref.ref} is gone and could not be "
+                f"reopened: {exc}"
+            ) from exc
+
+    async def notebook_view(self) -> LiveNotebook | LocalNotebook:
+        tab = await self.editor_tab()
+        return LiveNotebook(tab) if tab is not None else LocalNotebook(self)
 
     # -- notebook source -------------------------------------------------------
 
@@ -306,6 +365,7 @@ class KaggleSession:
         kernel_id: str | None = None,
         new_kernel: bool = False,
         refresh: bool = False,
+        use_browser: bool = True,
     ) -> dict:
         try:
             ref = parse_notebook_ref(notebook_url) if notebook_url else self.ref
@@ -317,6 +377,18 @@ class KaggleSession:
                 endpoint = parse_server_url(server_url)
             except UnsupportedServerUrl as exc:
                 raise ToolError(str(exc)) from exc
+
+        browser = self.browser if use_browser else None
+        # Nothing named: adopt the notebook already open in the browser's editor.
+        if ref is None and endpoint is None and browser is not None:
+            refs = sorted(set(await browser.open_editor_refs()))
+            if len(refs) > 1:
+                raise ToolError(
+                    f"Several notebooks are open in the browser's editor ({', '.join(refs)}); "
+                    "pass notebook_url to pick one."
+                )
+            if refs:
+                ref = _maybe_ref(refs[0])
 
         switching = ref != self.ref
         if switching:
@@ -333,7 +405,26 @@ class KaggleSession:
         self.state.notebook_ref = ref.ref if ref else None
         self._persist()
 
+        browser_note = None
+        if browser is not None and ref is not None:
+            try:
+                tab = await browser.open_editor(ref, EDITOR_WAIT)
+            except SignInRequired as exc:
+                self.state.mode = "editor"
+                self._persist()
+                return self._result(False, [str(exc)], sign_in_required=True)
+            except BrowserUnavailable as exc:
+                browser_note = f"{exc} Using the local working copy instead."
+            else:
+                self.state.mode = "editor"
+                self._persist()
+                return await self._open_editor(tab, endpoint, kernel_id, new_kernel)
+        self.state.mode = "local"
+        self._persist()
+
         notes = await self._load_doc(ref, refresh or False)
+        if browser_note:
+            notes.append(browser_note)
 
         # Already attached to the requested server: keep the kernel.
         if (
@@ -404,6 +495,33 @@ class KaggleSession:
             result["last_error"] = attach_error
         return result
 
+    async def _open_editor(
+        self,
+        editor: EditorTab,
+        endpoint: ServerEndpoint | None,
+        kernel_id: str | None,
+        new_kernel: bool,
+    ) -> dict:
+        notes = [EDITOR_NOTE.format(where=editor.describe()["browser"])]
+        extra: dict[str, Any] = {}
+        if endpoint is not None:
+            try:
+                extra["attach"] = await self._attach(endpoint, kernel_id, new_kernel)
+                notes.append(
+                    "Also attached to the Jupyter server; file transfers use it so they "
+                    "do not show up as cells."
+                )
+            except KernelUnavailable as exc:
+                notes.append(
+                    f"Could not attach to the Jupyter server as well ({exc}); file "
+                    "transfers will run as temporary cells in the editor."
+                )
+        try:
+            cells = await LiveNotebook(editor).cells()
+        except BridgeError as exc:
+            raise ToolError(f"The Kaggle editor tab did not respond: {exc}") from exc
+        return self._result(True, notes, cell_count=len(cells), **extra)
+
     async def ensure_kernel(self) -> RemoteKernel:
         if self.kernel is not None and self.kernel.connected:
             return self.kernel
@@ -446,6 +564,11 @@ class KaggleSession:
     # -- Kaggle sync -----------------------------------------------------------
 
     async def pull(self, discard_local_changes: bool) -> dict:
+        if self.editor_mode:
+            raise ToolError(
+                "The notebook is open in the Kaggle editor, which already holds its "
+                "current version; pull_notebook only refreshes the local working copy."
+            )
         doc = self.require_doc()
         if self.ref is None:
             raise ToolError("The scratch notebook has no Kaggle copy to pull.")
@@ -460,7 +583,8 @@ class KaggleSession:
     async def save(
         self, quick_save: bool, include_outputs: bool, accelerator: str | None
     ) -> dict:
-        doc = self.require_doc()
+        editor = await self.editor_tab()
+        doc = None if editor is not None else self.require_doc()
         if self.ref is None:
             raise ToolError("The scratch notebook has no Kaggle notebook to save to.")
         if self.notebook is None:
@@ -469,7 +593,14 @@ class KaggleSession:
                     "Saving needs Kaggle API credentials (~/.kaggle/access_token)."
                 )
             self.notebook = await self.api.get_notebook(self.ref)
-        text = json.dumps(doc.to_ipynb(include_outputs=include_outputs))
+        if editor is not None:
+            try:
+                content = await LiveNotebook(editor).to_ipynb(include_outputs)
+            except BridgeError as exc:
+                raise ToolError(str(exc)) from exc
+        else:
+            content = doc.to_ipynb(include_outputs=include_outputs)
+        text = json.dumps(content)
         try:
             saved = await self.api.save_notebook(
                 self.notebook,
@@ -479,10 +610,13 @@ class KaggleSession:
             )
         except KaggleApiError as exc:
             raise ToolError(str(exc)) from exc
-        doc.dirty = False
-        doc.base_version = saved.get("version_number") or doc.base_version
-        self.notebook.version = doc.base_version
-        doc.save()
+        version = saved.get("version_number")
+        if doc is not None:
+            doc.dirty = False
+            doc.base_version = version or doc.base_version
+            doc.save()
+            version = doc.base_version
+        self.notebook.version = version or self.notebook.version
         saved["quick_save"] = quick_save
         return saved
 
@@ -494,8 +628,12 @@ class KaggleSession:
         return payload
 
     def describe(self) -> dict:
-        doc = self.doc
+        editor = self.editor()
+        # In editor mode the tab holds the notebook; the local copy is not used.
+        doc = None if self.editor_mode else self.doc
         return {
+            "mode": "editor" if self.editor_mode else "local",
+            "editor": editor.describe() if editor is not None else None,
             "notebook": self.ref.ref if self.ref else None,
             "notebook_url": self.ref.url if self.ref else None,
             "kaggle_version": doc.base_version if doc else None,
@@ -510,8 +648,19 @@ class KaggleSession:
     async def status(self) -> dict:
         alive = await self.kernel.is_alive() if self.kernel else False
         payload = {
-            "connected": alive,
+            "connected": alive or self.editor() is not None,
+            "kernel_alive": alive,
             **self.describe(),
+            "browser": (
+                {
+                    "attached": self.browser.running,
+                    "which": self.browser.kind,
+                    "name": self.browser.name,
+                    "own_profile_dir": str(self.browser.profile_dir),
+                }
+                if self.browser
+                else None
+            ),
             "credentials": credentials_source(),
             "last_api_session_attempt": self.last_session_attempt,
             "auto_reconnect": AUTO_RECONNECT,
@@ -554,6 +703,73 @@ class KaggleSession:
         if self.kernel is not None:
             await self.kernel.close()
             self.kernel = None
+
+
+class LocalNotebook:
+    """The local working copy, run on the attached kernel (the mode without an editor tab).
+
+    Same interface as bridge.LiveNotebook, so the tools do not care which one
+    they are working on.
+    """
+
+    kind = "local"
+
+    def __init__(self, session: KaggleSession):
+        self.session = session
+
+    @property
+    def doc(self) -> NotebookDocument:
+        return self.session.require_doc()
+
+    @property
+    def dirty(self) -> bool:
+        return self.doc.dirty
+
+    async def cells(self) -> list[dict]:
+        return self.doc.cells
+
+    async def add(self, index: int | None, cell_type: str, source: str) -> str:
+        return self.doc.add(index, cell_type, source)
+
+    def _cell(self, cell_id: str) -> dict:
+        try:
+            return self.doc.get(cell_id)
+        except CellNotFound:
+            raise ToolError(f"Unknown cell id {cell_id}") from None
+
+    async def update(self, cell_id: str, source: str) -> None:
+        self._cell(cell_id)
+        self.doc.update(cell_id, source)
+
+    async def move(self, cell_id: str, index: int) -> int:
+        self._cell(cell_id)
+        self.doc.move(cell_id, index)
+        return self.doc.index_of(cell_id)
+
+    async def delete(self, cell_id: str) -> None:
+        self._cell(cell_id)
+        self.doc.delete(cell_id)
+
+    async def run(self, cell_id: str, timeout: float | None = None) -> dict:
+        source = self._cell(cell_id).get("source") or ""
+        reply = await self.session.execute(source, timeout=timeout)
+        outputs = reply.get("outputs") or []
+        try:
+            self.doc.set_outputs(cell_id, outputs, reply.get("execution_count"))
+        except CellNotFound:
+            pass  # deleted while it ran
+        return {"outputs": outputs, "execution_count": reply.get("execution_count")}
+
+    async def interrupt(self) -> None:
+        kernel = await self.session.ensure_kernel()
+        await kernel.interrupt()
+
+    async def restart(self) -> None:
+        kernel = await self.session.ensure_kernel()
+        await kernel.restart()
+
+    async def to_ipynb(self, include_outputs: bool = True) -> dict:
+        return self.doc.to_ipynb(include_outputs)
 
 
 def _maybe_ref(text: str) -> NotebookRef | None:

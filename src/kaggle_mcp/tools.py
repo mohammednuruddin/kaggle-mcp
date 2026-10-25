@@ -6,6 +6,10 @@ habits carry over. The composite tools (outline, run_cells, run_notebook,
 run_code, jobs, upload/download, export) behave the same. Two differences:
 cancel_job can really interrupt the running cell (Jupyter supports it), and
 there are Kaggle sync tools (pull_notebook, save_notebook).
+
+The tools work on whichever notebook the session points at: the Kaggle editor
+in the browser kaggle-mcp controls (cells appear there as they are added and
+run), otherwise the local working copy run on an attached Jupyter kernel.
 """
 
 from __future__ import annotations
@@ -27,7 +31,6 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 
-from kaggle_mcp.document import CellNotFound
 from kaggle_mcp.outputs import (
     result_with_images,
     strip_images,
@@ -157,30 +160,50 @@ print('<<B64>>' + base64.b64encode(_d).decode() + '<<END>>')
 def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
     jobs = Jobs()
 
-    def doc():
-        return session.require_doc()
+    async def view():
+        return await session.notebook_view()
 
-    def cell_or_error(cell_id: str) -> dict:
+    async def find_cell(nb, cell_id: str) -> dict:
+        for cell in await nb.cells():
+            if cell["id"] == cell_id:
+                return cell
+        raise ToolError(f"Unknown cell id {cell_id}")
+
+    async def temporary_cell(nb, code: str, timeout: float | None = None) -> dict:
+        """Run code as a cell at the end of the editor's notebook, then remove it."""
+        cell_id = await nb.add(None, "code", code)
+        reply = await nb.run(cell_id, timeout=timeout)
+        await nb.delete(cell_id)
+        return reply
+
+    async def hidden_kernel_available() -> bool:
+        if session.kernel is not None and session.kernel.connected:
+            return True
+        if not session.state.server_url:
+            return False
         try:
-            return doc().get(cell_id)
-        except CellNotFound:
-            raise ToolError(f"Unknown cell id {cell_id}") from None
+            await session.ensure_kernel()
+        except ToolError:
+            return False
+        return True
 
     async def snippet(code: str, max_chars: int = 0) -> dict[str, Any]:
-        reply = await session.execute(code)
+        """Helper code (hashing, file chunks). In editor mode it runs on the Jupyter
+        server's kernel when one is attached, so it does not show up as cells."""
+        nb = await view()
+        if nb.kind == "editor" and not await hidden_kernel_available():
+            reply = await temporary_cell(nb, code)
+        else:
+            reply = await session.execute(code)
         return summarize_outputs(reply.get("outputs"), max_chars)
 
     async def run_cell(cell_id: str, max_chars: int) -> dict[str, Any]:
-        cell = cell_or_error(cell_id)
+        nb = await view()
+        cell = await find_cell(nb, cell_id)
         if cell["cell_type"] != "code":
             raise ToolError(f"Cell {cell_id} is a {cell['cell_type']} cell, not code")
-        reply = await session.execute(_source(cell))
-        outputs = reply.get("outputs") or []
-        try:
-            doc().set_outputs(cell_id, outputs, reply.get("execution_count"))
-        except CellNotFound:
-            pass  # deleted while it ran
-        summary = summarize_outputs(outputs, max_chars)
+        reply = await nb.run(cell_id)
+        summary = summarize_outputs(reply.get("outputs"), max_chars)
         summary["cell_id"] = cell_id
         summary["execution_count"] = reply.get("execution_count")
         return summary
@@ -216,10 +239,11 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
             job.current = None
             job.finished = time.time()
 
-    def select_cells(
+    async def select_cells(
         cell_ids: list[str] | None, start_index: int | None, end_index: int | None
     ) -> list[str]:
-        cells = doc().cells
+        nb = await view()
+        cells = await nb.cells()
         if cell_ids:
             known = {c["id"] for c in cells}
             missing = [c for c in cell_ids if c not in known]
@@ -242,11 +266,19 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
         kernel_id: str | None = None,
         new_kernel: bool = False,
         refresh: bool = False,
+        use_browser: bool = True,
     ) -> dict:
         """Connect to a Kaggle notebook and a live kernel to run its code on.
 
         notebook_url: a kaggle.com/code/<owner>/<slug> link (with or without /edit) or
-        owner/slug. Its cells are pulled into a local working copy for the cell tools.
+        owner/slug. By default the notebook's editor opens in a browser kaggle-mcp
+        controls (the user's Edge/Chrome if remote debugging is on there, else its own
+        window), and the cell tools work on it directly: cells you add and run appear
+        there as they happen. If that browser is not signed in to Kaggle the result
+        has sign_in_required; ask the user to sign in, then call again. With no
+        notebook_url, a notebook already open in that browser is used.
+        use_browser=False instead pulls the cells into a local working copy and runs
+        them on a Jupyter server (below).
         server_url: the 'VS Code compatible URL' from Run > Kaggle Jupyter Server in the
         Kaggle editor. Without it, the saved server from last time is reused, else (if
         start_session) a session is started through the Kaggle API with `accelerator`
@@ -265,6 +297,7 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
             kernel_id=kernel_id,
             new_kernel=new_kernel,
             refresh=refresh,
+            use_browser=use_browser,
         )
 
     @mcp.tool
@@ -284,39 +317,42 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
     @mcp.tool
     async def get_cells(includeOutputs: bool = False) -> dict:
         """All cells of the open notebook with ids, type and source (and raw outputs if includeOutputs)."""
-        return {"cells": [_cell_view(c, includeOutputs) for c in doc().cells]}
+        nb = await view()
+        cells = await nb.cells()
+        return {"cells": [_cell_view(c, includeOutputs) for c in cells]}
 
     @mcp.tool
     async def add_code_cell(
         code: str, cellIndex: int | None = None, language: str = "python"
     ) -> dict:
         """Insert a code cell at cellIndex (default: end). Returns newCellId."""
-        return {"newCellId": doc().add(cellIndex, "code", code)}
+        nb = await view()
+        return {"newCellId": await nb.add(cellIndex, "code", code)}
 
     @mcp.tool
     async def add_text_cell(content: str, cellIndex: int | None = None) -> dict:
         """Insert a markdown cell at cellIndex (default: end). Returns newCellId."""
-        return {"newCellId": doc().add(cellIndex, "markdown", content)}
+        nb = await view()
+        return {"newCellId": await nb.add(cellIndex, "markdown", content)}
 
     @mcp.tool
     async def update_cell(cellId: str, content: str) -> dict:
         """Replace a cell's source."""
-        cell_or_error(cellId)
-        doc().update(cellId, content)
+        nb = await view()
+        await nb.update(cellId, content)
         return {"cellId": cellId, "updated": True}
 
     @mcp.tool
     async def move_cell(cellId: str, cellIndex: int) -> dict:
         """Move a cell to cellIndex."""
-        cell_or_error(cellId)
-        doc().move(cellId, cellIndex)
-        return {"cellId": cellId, "cellIndex": doc().index_of(cellId)}
+        nb = await view()
+        return {"cellId": cellId, "cellIndex": await nb.move(cellId, cellIndex)}
 
     @mcp.tool
     async def delete_cell(cellId: str) -> dict:
         """Delete a cell."""
-        cell_or_error(cellId)
-        doc().delete(cellId)
+        nb = await view()
+        await nb.delete(cellId)
         return {"cellId": cellId, "deleted": True}
 
     @mcp.tool
@@ -331,7 +367,8 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
     @mcp.tool
     async def get_notebook_outline() -> dict:
         """Cells as index, id, type, first source line and whether they have outputs or errors. Cheaper than get_cells."""
-        cells = doc().cells
+        nb = await view()
+        cells = await nb.cells()
         outline = []
         for index, cell in enumerate(cells):
             source = _source(cell)
@@ -349,8 +386,9 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
                 }
             )
         return {
+            "mode": nb.kind,
             "cell_count": len(cells),
-            "unsaved_changes": doc().dirty,
+            "unsaved_changes": nb.dirty,
             "cells": outline,
         }
 
@@ -362,7 +400,7 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
         background: bool,
         max_output_chars: int,
     ) -> dict:
-        ids = select_cells(cell_ids, start_index, end_index)
+        ids = await select_cells(cell_ids, start_index, end_index)
         if not ids:
             raise ToolError("No code cells matched")
         if background:
@@ -423,18 +461,26 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
         timeout_seconds: float | None = None,
         max_output_chars: int = 8000,
     ) -> ToolResult:
-        """Run ad-hoc Python on the Kaggle kernel without touching the notebook.
+        """Run ad-hoc Python on the Kaggle kernel without keeping it in the notebook.
 
-        keep_cell=True appends it to the notebook as a cell instead. Plots come back
-        as image content. background=True returns a job id.
+        In the Kaggle editor it runs as a visible cell at the end that is removed
+        afterwards. keep_cell=True keeps it as a cell. Plots come back as image
+        content. background=True returns a job id.
         """
         if not code.strip():
             raise ToolError("code is empty")
 
         async def once() -> dict:
-            if keep_cell:
-                cell_id = doc().add(None, "code", code)
-                return await run_cell(cell_id, max_output_chars)
+            nb = await view()
+            if keep_cell or nb.kind == "editor":
+                cell_id = await nb.add(None, "code", code)
+                reply = await nb.run(cell_id, timeout=timeout_seconds)
+                if not keep_cell:
+                    await nb.delete(cell_id)
+                summary = summarize_outputs(reply.get("outputs"), max_output_chars)
+                summary["cell_id"] = cell_id if keep_cell else None
+                summary["execution_count"] = reply.get("execution_count")
+                return summary
             reply = await session.execute(code, timeout=timeout_seconds)
             summary = summarize_outputs(reply.get("outputs"), max_output_chars)
             summary["cell_id"] = None
@@ -503,9 +549,14 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
             }
         job.cancel_requested = True
         interrupted = False
-        if interrupt and session.kernel is not None:
-            await session.kernel.interrupt()
-            interrupted = True
+        if interrupt:
+            nb = await view()
+            if nb.kind == "editor":
+                await nb.interrupt()
+                interrupted = True
+            elif session.kernel is not None:
+                await session.kernel.interrupt()
+                interrupted = True
         return {
             "job_id": job.id,
             "state": job.state,
@@ -516,6 +567,10 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
     @mcp.tool
     async def interrupt_kernel() -> dict:
         """Send KeyboardInterrupt to whatever is running on the kernel."""
+        nb = await view()
+        if nb.kind == "editor":
+            await nb.interrupt()
+            return {"interrupted": True, "via": "editor"}
         kernel = await session.ensure_kernel()
         await kernel.interrupt()
         return {"interrupted": True, "kernel_id": kernel.kernel_id}
@@ -523,6 +578,10 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
     @mcp.tool
     async def restart_kernel() -> dict:
         """Restart the kernel, clearing all variables. Files on disk are kept."""
+        nb = await view()
+        if nb.kind == "editor":
+            await nb.restart()
+            return {"restarted": True, "via": "editor"}
         kernel = await session.ensure_kernel()
         await kernel.restart()
         return {"restarted": True, "kernel_id": kernel.kernel_id}
@@ -645,10 +704,12 @@ def register_tools(mcp: FastMCP, session: KaggleSession) -> Jobs:
         """Save the open notebook as an .ipynb file on this machine."""
         dst = _local(local_path)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_text(json.dumps(doc().to_ipynb(include_outputs), indent=1))
+        nb = await view()
+        content = await nb.to_ipynb(include_outputs)
+        dst.write_text(json.dumps(content, indent=1))
         return {
             "local_path": str(dst),
-            "cell_count": len(doc().cells),
+            "cell_count": len(content["cells"]),
             "bytes": dst.stat().st_size,
         }
 
